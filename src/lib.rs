@@ -1,15 +1,18 @@
 mod decompression;
 
-use crate::decompression::{decompress_bufread, Algorithm};
+use crate::decompression::{decompress_async_buf_read, Algorithm};
 use anyhow::{bail, Context, Result};
 use argh::FromArgs;
 use aws_sdk_s3::Client;
 use bytes::buf::Reader;
 use bytes::{Buf, Bytes};
 use log::info;
-use std::io::BufRead;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::io::AsyncBufRead;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -89,72 +92,63 @@ pub async fn list_s3_uri(client: &Client, bucket: &str, prefix: &str) -> Result<
     Ok(vec)
 }
 
+pub type ObjectReader = Pin<Box<dyn AsyncBufRead + Send + Sync>>;
+
 pub async fn read_objects(
     client: Arc<Client>,
     bucket: String,
     key: String,
-) -> Result<Reader<Bytes>> {
-    let reader = (|| async {
-        let resp = client.get_object().bucket(bucket).key(key).send().await?;
-        let input_reader = resp.body.collect().await?.into_bytes().reader();
-        Ok(input_reader)
-    })()
-    .await;
-    reader
+) -> Result<ObjectReader> {
+    let resp = client.get_object().bucket(bucket).key(key).send().await?;
+    let output_reader = BufReader::new(resp.body.into_async_read());
+    let output_reader: ObjectReader = Box::pin(output_reader);
+    Ok(output_reader)
 }
 
-pub type ReceiveTaskJoinHandle = JoinHandle<Result<Reader<Bytes>>>;
-
-pub async fn create_receive_task_worker(
+pub async fn receive_task_worker(
     client: Client,
     bucket: String,
+    sem: Arc<Semaphore>,
     mut in_channel: Receiver<String>,
-    out_channel: Sender<(String, ReceiveTaskJoinHandle)>,
+    out_channel: Sender<(String, Result<(ObjectReader, OwnedSemaphorePermit)>)>,
 ) {
     let client = Arc::new(client);
     while let Some(key) = in_channel.recv().await {
+        let permit_owned = sem.clone().acquire_owned().await.unwrap();
         info!("{} recv task created", key);
-        let task = tokio::spawn(read_objects(client.clone(), bucket.clone(), key.clone()));
+        let task = read_objects(client.clone(), bucket.clone(), key.clone()).await;
+        let result = task.map(|reader| (reader, permit_owned));
         out_channel
-            .send((key.clone(), task))
+            .send((key.clone(), result))
             .await
-            .expect("broken internal pipe");
-    }
-}
-
-pub async fn resolve_receive_task_worker(
-    mut in_channel: Receiver<(String, ReceiveTaskJoinHandle)>,
-    out_channel: Sender<(String, Reader<Bytes>)>,
-) {
-    while let Some((key, join_handle)) = in_channel.recv().await {
-        let result = join_handle.await.unwrap();
-        info!("{} recv task resolved", key);
-        match result {
-            Ok(reader) => {
-                out_channel
-                    .send((key.clone(), reader))
-                    .await
-                    .expect("broken internal pipe");
-            }
-            Err(e) => {
-                eprintln!("error reading {}: {:#?}", key, e);
-            }
-        }
+            .unwrap_or_else(|_| panic!("broken internal pipe"))
     }
 }
 
 pub async fn decompressor_worker(
-    mut in_channel: Receiver<(String, Reader<Bytes>)>,
+    mut in_channel: Receiver<(String, Result<(ObjectReader, OwnedSemaphorePermit)>)>,
     out_channel: Sender<(String, String)>,
     compression_algorithm: Algorithm,
 ) {
-    while let Some((key, reader)) = in_channel.recv().await {
-        let decompressed_buf_read = decompress_bufread(reader, compression_algorithm);
-        for read_result in decompressed_buf_read.lines() {
-            out_channel
-                .send((key.clone(), read_result.unwrap()))
-                .await
-                .expect("broken internal pipe");
+    while let Some((key, result)) = in_channel.recv().await {
+        info!("{} decompression started", key);
+        match result {
+            Ok((reader, permit)) => {
+                let decompressed_buf_read =
+                    decompress_async_buf_read(reader, compression_algorithm).await;
+                let mut lines = decompressed_buf_read.lines();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    out_channel
+                        .send((key.clone(), line))
+                        .await
+                        .expect("broken internal pipe");
+                }
+                info!("{} decompression completed", key);
+                drop(permit);
+            }
+            Err(e) => {
+                eprintln!("Error reading {}: {:?}", key, e);
+            }
         }
     }
 }
@@ -190,19 +184,20 @@ pub async fn entrypoint() -> Result<()> {
 
     let concurrency = args.concurrency.unwrap_or(4);
 
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
     let (key_tx, key_rx) = channel(1024);
-    let (task_tx, task_rx) = channel(concurrency);
-    let (result_tx, result_rx) = channel(1024);
+    let (task_tx, task_rx) = channel(1024);
     let (decompressed_tx, decompressed_rx) = channel(1024);
-    let task_creator_handle = tokio::spawn(create_receive_task_worker(
+    let task_creator_handle = tokio::spawn(receive_task_worker(
         client,
         bucket.clone(),
+        semaphore.clone(),
         key_rx,
         task_tx,
     ));
-    let task_resolver_handle = tokio::spawn(resolve_receive_task_worker(task_rx, result_tx));
     let decompressor_handle = tokio::spawn(decompressor_worker(
-        result_rx,
+        task_rx,
         decompressed_tx,
         compression_algorithm,
     ));
@@ -216,7 +211,6 @@ pub async fn entrypoint() -> Result<()> {
 
     let join_handle = futures::future::join_all(vec![
         task_creator_handle,
-        task_resolver_handle,
         decompressor_handle,
         printer_handle,
     ]);
