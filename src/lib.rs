@@ -211,6 +211,8 @@ pub async fn entrypoint() -> Result<()> {
     for key in list_result {
         key_tx.send(key).await.expect("broken internal pipe");
     }
+    // close channel
+    drop(key_tx);
 
     let join_handle = futures::future::join_all(vec![
         task_creator_handle,
