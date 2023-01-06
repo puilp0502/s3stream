@@ -6,9 +6,11 @@ use argh::FromArgs;
 use aws_sdk_s3::Client;
 use bytes::buf::Reader;
 use bytes::{Buf, Bytes};
-use futures::{stream, StreamExt, TryStreamExt};
+use log::info;
 use std::io::BufRead;
 use std::sync::Arc;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::task::JoinHandle;
 use url::Url;
 
 #[derive(Debug)]
@@ -23,6 +25,10 @@ pub struct Args {
     #[argh(option)]
     /// if present, only cat files starting with prefix
     pub prefix: Option<String>,
+
+    #[argh(option, short = 'n')]
+    /// number of concurrent requests to make
+    pub concurrency: Option<usize>,
 
     #[argh(switch, short = 'm')]
     /// print output in multifile streaming format
@@ -87,35 +93,91 @@ pub async fn read_objects(
     client: Arc<Client>,
     bucket: String,
     key: String,
-) -> (String, Result<Reader<Bytes>>) {
+) -> Result<Reader<Bytes>> {
     let reader = (|| async {
-        let resp = client.get_object().bucket(bucket).key(&key).send().await?;
+        let resp = client.get_object().bucket(bucket).key(key).send().await?;
         let input_reader = resp.body.collect().await?.into_bytes().reader();
         Ok(input_reader)
     })()
     .await;
-    (key, reader)
+    reader
 }
 
-pub fn decompress_and_print_objects(reader: Reader<Bytes>, compression_algorithm: Algorithm) {
-    let output_stream = decompress_bufread(reader, compression_algorithm);
+pub type ReceiveTaskJoinHandle = JoinHandle<Result<Reader<Bytes>>>;
 
-    for line in output_stream.lines() {
-        if let Ok(line) = line {
-            println!("{}", line);
+pub async fn create_receive_task_worker(
+    client: Client,
+    bucket: String,
+    mut in_channel: Receiver<String>,
+    out_channel: Sender<(String, ReceiveTaskJoinHandle)>,
+) {
+    let client = Arc::new(client);
+    while let Some(key) = in_channel.recv().await {
+        info!("{} recv task created", key);
+        let task = tokio::spawn(read_objects(client.clone(), bucket.clone(), key.clone()));
+        out_channel
+            .send((key.clone(), task))
+            .await
+            .expect("broken internal pipe");
+    }
+}
+
+pub async fn resolve_receive_task_worker(
+    mut in_channel: Receiver<(String, ReceiveTaskJoinHandle)>,
+    out_channel: Sender<(String, Reader<Bytes>)>,
+) {
+    while let Some((key, join_handle)) = in_channel.recv().await {
+        let result = join_handle.await.unwrap();
+        info!("{} recv task resolved", key);
+        match result {
+            Ok(reader) => {
+                out_channel
+                    .send((key.clone(), reader))
+                    .await
+                    .expect("broken internal pipe");
+            }
+            Err(e) => {
+                eprintln!("error reading {}: {:#?}", key, e);
+            }
         }
     }
 }
+
+pub async fn decompressor_worker(
+    mut in_channel: Receiver<(String, Reader<Bytes>)>,
+    out_channel: Sender<(String, String)>,
+    compression_algorithm: Algorithm,
+) {
+    while let Some((key, reader)) = in_channel.recv().await {
+        let decompressed_buf_read = decompress_bufread(reader, compression_algorithm);
+        for read_result in decompressed_buf_read.lines() {
+            out_channel
+                .send((key.clone(), read_result.unwrap()))
+                .await
+                .expect("broken internal pipe");
+        }
+    }
+}
+
+pub async fn printer_worker(mut in_channel: Receiver<(String, String)>) {
+    while let Some((_, line)) = in_channel.recv().await {
+        println!("{}", line);
+    }
+}
+
 pub async fn entrypoint() -> Result<()> {
+    env_logger::init();
+
     let args: Args = argh::from_env();
     let s3_uri = parse_s3_uri(&args.s3_uri)?;
 
     let sdk_config = aws_config::from_env().load().await;
-    let client = Arc::new(Client::new(&sdk_config));
+    let client = Client::new(&sdk_config);
 
+    let bucket = s3_uri.bucket_name;
     let prefix = format!("{}{}", s3_uri.path, args.prefix.unwrap_or_default());
 
-    let list_result = list_s3_uri(&client, &s3_uri.bucket_name, &prefix).await?;
+    let list_result = list_s3_uri(&client, &bucket, &prefix).await?;
 
     eprintln!("{:#?}", list_result);
     eprintln!("Total count: {}", list_result.len());
@@ -126,28 +188,38 @@ pub async fn entrypoint() -> Result<()> {
         Algorithm::None
     };
 
-    let key_stream = stream::iter(list_result);
-    let mut object_bodies = key_stream
-        .map(|key| {
-            tokio::spawn(read_objects(
-                client.clone(),
-                s3_uri.bucket_name.clone(),
-                key,
-            ))
-        })
-        .buffered(4);
+    let concurrency = args.concurrency.unwrap_or(4);
 
-    while let Some(join_handle) = object_bodies.next().await {
-        let (key, result) = join_handle.unwrap();
-        match result {
-            Ok(reader) => {
-                decompress_and_print_objects(reader, compression_algorithm);
-            }
-            Err(e) => {
-                eprintln!("error reading object \"{}\": {:?}", key, e);
-            }
-        }
+    let (key_tx, key_rx) = channel(1024);
+    let (task_tx, task_rx) = channel(concurrency);
+    let (result_tx, result_rx) = channel(1024);
+    let (decompressed_tx, decompressed_rx) = channel(1024);
+    let task_creator_handle = tokio::spawn(create_receive_task_worker(
+        client,
+        bucket.clone(),
+        key_rx,
+        task_tx,
+    ));
+    let task_resolver_handle = tokio::spawn(resolve_receive_task_worker(task_rx, result_tx));
+    let decompressor_handle = tokio::spawn(decompressor_worker(
+        result_rx,
+        decompressed_tx,
+        compression_algorithm,
+    ));
+    let printer_handle = tokio::spawn(printer_worker(decompressed_rx));
+
+    for key in list_result {
+        key_tx.send(key).await.expect("broken internal pipe");
     }
+
+    let join_handle = futures::future::join_all(vec![
+        task_creator_handle,
+        task_resolver_handle,
+        decompressor_handle,
+        printer_handle,
+    ]);
+
+    join_handle.await;
 
     Ok(())
 }
