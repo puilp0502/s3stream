@@ -1,5 +1,6 @@
 mod decompression;
 
+use std::io::Cursor;
 use crate::decompression::{decompress_async_buf_read, Algorithm};
 use anyhow::{bail, Context, Result};
 use argh::FromArgs;
@@ -9,7 +10,9 @@ use bytes::{Buf, Bytes};
 use log::info;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::AsyncBufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufRead, AsyncRead};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -92,17 +95,60 @@ pub async fn list_s3_uri(client: &Client, bucket: &str, prefix: &str) -> Result<
     Ok(vec)
 }
 
+pub type UnbufferedReader = Pin<Box<dyn AsyncRead + Send + Sync>>;
 pub type ObjectReader = Pin<Box<dyn AsyncBufRead + Send + Sync>>;
 
-pub async fn read_objects(
+pub struct PrefetchWorkerHandle {
+    pub stop_flag: Arc<AtomicBool>,
+    pub join_handle: JoinHandle<Result<ObjectReader>>
+}
+
+impl PrefetchWorkerHandle {
+    async fn resolve_object_reader(self) -> Result<ObjectReader> {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.join_handle.await.unwrap()
+    }
+}
+
+pub async fn create_object_reader(
     client: Arc<Client>,
     bucket: String,
     key: String,
-) -> Result<ObjectReader> {
+) -> Result<UnbufferedReader> {
     let resp = client.get_object().bucket(bucket).key(key).send().await?;
-    let output_reader = BufReader::new(resp.body.into_async_read());
-    let output_reader: ObjectReader = Box::pin(output_reader);
+    let output_reader = resp.body.into_async_read();
+    let output_reader: UnbufferedReader = Box::pin(output_reader);
     Ok(output_reader)
+}
+
+pub fn create_prefetch_worker(object_reader: UnbufferedReader) -> PrefetchWorkerHandle {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let join_handle = tokio::spawn(prefetch_object_reader_worker(stop_flag.clone(), object_reader));
+    PrefetchWorkerHandle {
+        stop_flag,
+        join_handle,
+    }
+}
+
+// FIXME: This can be optimized to avoid double-copying
+pub async fn prefetch_object_reader_worker(
+    stop_flag: Arc<AtomicBool>,
+    mut object_reader: UnbufferedReader,
+) -> Result<ObjectReader> {
+    let mut stash = vec![];
+    while !stop_flag.load(Ordering::Relaxed) {
+        let mut buf = vec![0 as u8; 64 * 1024];
+        let read_bytes = object_reader.read(&mut buf).await?;
+        stash.extend_from_slice(&buf[..read_bytes]);
+        if read_bytes == 0 {
+            break;
+        }
+    }
+    let stash = Cursor::new(stash);
+
+    let chained_reader = AsyncReadExt::chain(stash, object_reader);
+    let chained_reader: ObjectReader = Box::pin(BufReader::new(chained_reader));
+    Ok(chained_reader)
 }
 
 pub async fn receive_task_worker(
@@ -110,14 +156,14 @@ pub async fn receive_task_worker(
     bucket: String,
     sem: Arc<Semaphore>,
     mut in_channel: Receiver<String>,
-    out_channel: Sender<(String, Result<(ObjectReader, OwnedSemaphorePermit)>)>,
+    out_channel: Sender<(String, Result<(PrefetchWorkerHandle, OwnedSemaphorePermit)>)>,
 ) {
     let client = Arc::new(client);
     while let Some(key) = in_channel.recv().await {
         let permit_owned = sem.clone().acquire_owned().await.unwrap();
         info!("{} recv task created", key);
-        let task = read_objects(client.clone(), bucket.clone(), key.clone()).await;
-        let result = task.map(|reader| (reader, permit_owned));
+        let task = create_object_reader(client.clone(), bucket.clone(), key.clone()).await;
+        let result = task.map(|reader| (create_prefetch_worker(reader), permit_owned));
         out_channel
             .send((key.clone(), result))
             .await
@@ -126,24 +172,32 @@ pub async fn receive_task_worker(
 }
 
 pub async fn decompressor_worker(
-    mut in_channel: Receiver<(String, Result<(ObjectReader, OwnedSemaphorePermit)>)>,
+    mut in_channel: Receiver<(String, Result<(PrefetchWorkerHandle, OwnedSemaphorePermit)>)>,
     out_channel: Sender<(String, String)>,
     compression_algorithm: Algorithm,
 ) {
     while let Some((key, result)) = in_channel.recv().await {
         info!("{} decompression started", key);
         match result {
-            Ok((reader, permit)) => {
-                let decompressed_buf_read =
-                    decompress_async_buf_read(reader, compression_algorithm).await;
-                let mut lines = decompressed_buf_read.lines();
-                while let Some(line) = lines.next_line().await.unwrap() {
-                    out_channel
-                        .send((key.clone(), line))
-                        .await
-                        .expect("broken internal pipe");
+            Ok((handle, permit)) => {
+                let reader_result = handle.resolve_object_reader().await;
+                match reader_result {
+                    Ok(reader) => {
+                        let decompressed_buf_read =
+                            decompress_async_buf_read(reader, compression_algorithm).await;
+                        let mut lines = decompressed_buf_read.lines();
+                        while let Some(line) = lines.next_line().await.unwrap() {
+                            out_channel
+                                .send((key.clone(), line))
+                                .await
+                                .expect("broken internal pipe");
+                        }
+                        info!("{} decompression completed", key);
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading {}: {:?}", key, e);
+                    }
                 }
-                info!("{} decompression completed", key);
                 drop(permit);
             }
             Err(e) => {
