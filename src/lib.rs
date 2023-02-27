@@ -1,16 +1,15 @@
 mod decompression;
 
-use std::io::Cursor;
 use crate::decompression::{decompress_async_buf_read, Algorithm};
 use anyhow::{bail, Context, Result};
 use argh::FromArgs;
 use aws_sdk_s3::Client;
-use bytes::buf::Reader;
-use bytes::{Buf, Bytes};
+use flume::bounded;
 use log::info;
+use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufRead, AsyncRead};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -35,6 +34,10 @@ pub struct Args {
     #[argh(option, short = 'n')]
     /// number of concurrent requests to make
     pub concurrency: Option<usize>,
+
+    #[argh(option, short = 'D')]
+    /// number of decompression tasks
+    pub decompression_concurrency: Option<usize>,
 
     #[argh(switch, short = 'm')]
     /// print output in multifile streaming format
@@ -100,7 +103,7 @@ pub type ObjectReader = Pin<Box<dyn AsyncBufRead + Send + Sync>>;
 
 pub struct PrefetchWorkerHandle {
     pub stop_flag: Arc<AtomicBool>,
-    pub join_handle: JoinHandle<Result<ObjectReader>>
+    pub join_handle: JoinHandle<Result<ObjectReader>>,
 }
 
 impl PrefetchWorkerHandle {
@@ -123,7 +126,10 @@ pub async fn create_object_reader(
 
 pub fn create_prefetch_worker(object_reader: UnbufferedReader) -> PrefetchWorkerHandle {
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let join_handle = tokio::spawn(prefetch_object_reader_worker(stop_flag.clone(), object_reader));
+    let join_handle = tokio::spawn(prefetch_object_reader_worker(
+        stop_flag.clone(),
+        object_reader,
+    ));
     PrefetchWorkerHandle {
         stop_flag,
         join_handle,
@@ -156,7 +162,7 @@ pub async fn receive_task_worker(
     bucket: String,
     sem: Arc<Semaphore>,
     mut in_channel: Receiver<String>,
-    out_channel: Sender<(String, Result<(PrefetchWorkerHandle, OwnedSemaphorePermit)>)>,
+    out_channel: flume::Sender<(String, Result<(PrefetchWorkerHandle, OwnedSemaphorePermit)>)>,
 ) {
     let client = Arc::new(client);
     while let Some(key) = in_channel.recv().await {
@@ -165,18 +171,18 @@ pub async fn receive_task_worker(
         let task = create_object_reader(client.clone(), bucket.clone(), key.clone()).await;
         let result = task.map(|reader| (create_prefetch_worker(reader), permit_owned));
         out_channel
-            .send((key.clone(), result))
+            .send_async((key.clone(), result))
             .await
             .unwrap_or_else(|_| panic!("broken internal pipe"))
     }
 }
 
 pub async fn decompressor_worker(
-    mut in_channel: Receiver<(String, Result<(PrefetchWorkerHandle, OwnedSemaphorePermit)>)>,
+    in_channel: flume::Receiver<(String, Result<(PrefetchWorkerHandle, OwnedSemaphorePermit)>)>,
     out_channel: Sender<(String, String)>,
     compression_algorithm: Algorithm,
 ) {
-    while let Some((key, result)) = in_channel.recv().await {
+    while let Ok((key, result)) = in_channel.recv_async().await {
         info!("{} decompression started", key);
         match result {
             Ok((handle, permit)) => {
@@ -237,11 +243,12 @@ pub async fn entrypoint() -> Result<()> {
     };
 
     let concurrency = args.concurrency.unwrap_or(4);
+    let decompression_concurrency = args.decompression_concurrency.unwrap_or(1);
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
     let (key_tx, key_rx) = channel(1024);
-    let (task_tx, task_rx) = channel(1024);
+    let (task_tx, task_rx) = bounded(1024);
     let (decompressed_tx, decompressed_rx) = channel(1024);
     let task_creator_handle = tokio::spawn(receive_task_worker(
         client,
@@ -250,11 +257,17 @@ pub async fn entrypoint() -> Result<()> {
         key_rx,
         task_tx,
     ));
-    let decompressor_handle = tokio::spawn(decompressor_worker(
-        task_rx,
-        decompressed_tx,
-        compression_algorithm,
-    ));
+    let mut decompressor_handles = vec![];
+    for _ in 0..decompression_concurrency {
+        let task_rx = task_rx.clone();
+        let decompressed_tx = decompressed_tx.clone();
+        let compression_algorithm = compression_algorithm.clone();
+        decompressor_handles.push(tokio::spawn(decompressor_worker(
+            task_rx,
+            decompressed_tx,
+            compression_algorithm,
+        )));
+    }
     let printer_handle = tokio::spawn(printer_worker(decompressed_rx));
 
     for key in list_result {
@@ -263,11 +276,8 @@ pub async fn entrypoint() -> Result<()> {
     // close channel
     drop(key_tx);
 
-    let join_handle = futures::future::join_all(vec![
-        task_creator_handle,
-        decompressor_handle,
-        printer_handle,
-    ]);
+    decompressor_handles.extend([task_creator_handle, printer_handle]);
+    let join_handle = futures::future::join_all(decompressor_handles);
 
     join_handle.await;
 
