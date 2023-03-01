@@ -268,6 +268,7 @@ pub async fn entrypoint() -> Result<()> {
             compression_algorithm,
         )));
     }
+    drop(decompressed_tx);
     let printer_handle = tokio::spawn(printer_worker(decompressed_rx));
 
     for key in list_result {
@@ -276,10 +277,9 @@ pub async fn entrypoint() -> Result<()> {
     // close channel
     drop(key_tx);
 
-    decompressor_handles.extend([task_creator_handle, printer_handle]);
-    let join_handle = futures::future::join_all(decompressor_handles);
-
-    join_handle.await;
+    task_creator_handle.await.unwrap();
+    futures::future::join_all(decompressor_handles).await;
+    printer_handle.await.unwrap();
 
     Ok(())
 }
